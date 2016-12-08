@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+
+from ansible import __version__ as ansible_version
+from ansible import constants
+from ansible.inventory import Inventory
+from ansible.errors import AnsibleError
+
+import argparse
+import getpass
+import json
+import os
+import yaml
+
+ANSIBLE_VERSION = ansible_version.partition('.')[0]
+
+if ANSIBLE_VERSION == '2':
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.vars import VariableManager
+    from ansible.utils.vars import load_extra_vars
+    from ansible.utils.vars import load_options_vars
+elif ANSIBLE_VERSION == '1':
+    from ansible.utils import path_dwim
+
+
+class AnsibleTerm(object):
+    def __init__(self, name, path, data):
+        self._name = name
+        self._path = path
+        self._data = data
+
+    def __str__(self):
+        return json.dumps({"name": self._name,
+                           "path": self._path,
+                           "data": self._data})
+
+
+class RoleFinder(object):
+
+    ROLE_PATHS = [os.path.join(os.getcwd(), "roles")]
+    if constants.DEFAULT_ROLES_PATH is not None:
+        ROLE_PATHS.extend(
+            map(lambda path: os.path.abspath(os.path.expanduser(path)),
+                constants.DEFAULT_ROLES_PATH.split(os.pathsep)))
+
+    _ROLE_PATH_CACHE = {}
+
+    @staticmethod
+    def list_roles():
+        roles = []
+        for basedir in RoleFinder.ROLE_PATHS:
+            for role_name in os.listdir(basedir):
+                role_path = os.path.join(basedir, role_name)
+                for subdir in ['handlers', 'meta', 'tasks', 'vars']:
+                    # if contains any handlers, tasks, vars and meta, treat as
+                    # a functional role.
+                    if os.path.exists(os.path.join(role_path, subdir,
+                                                   "main.yml")):
+                        roles.append(Role(role_name, role_path))
+                        RoleFinder._ROLE_PATH_CACHE[role_name] = role_path
+                        break
+        return roles
+
+    @staticmethod
+    def find_role(name, data):
+        if name in RoleFinder._ROLE_PATH_CACHE:
+            return Role(name, RoleFinder._ROLE_PATH_CACHE[name], data)
+        for basedir in RoleFinder.ROLE_PATHS:
+            if not os.path.isdir(basedir):
+                continue
+            for role_name in os.listdir(basedir):
+                if role_name == name:
+                    role_path = os.path.join(basedir, role_name)
+                    RoleFinder._ROLE_PATH_CACHE[role_name] = role_path
+                    return Role(role_name, role_path, data)
+        raise AnsibleError("Role %s couldn't be found" % name)
+
+
+class Role(AnsibleTerm):
+    def __init__(self, name, path, data={}):
+        super(Role, self).__init__(name, path, data)
+        self.requires = self._build_requirements()
+
+    def _build_requirements(self):
+        meta_main = os.path.join(self._path, "meta", "main.yml")
+        if not os.path.exists(meta_main):
+            return []
+        with open(meta_main) as meta:
+            metadata = yaml.safe_load(meta)
+        if 'requires' in metadata:
+            return filter(self._parse_require, metadata.get('requires') or [])
+        if 'dependencies' in metadata:
+            return filter(self._parse_dep, metadata.get('dependencies') or [])
+
+    def _parse_dep(self, dependency):
+        if isinstance(dependency, str):
+            role_name = dependency
+        else:
+            role_name = dependency.get('role')
+        return {'role': RoleFinder.find_role(role, dependency),
+                'scope': 'local'}
+
+    def _parse_require(self, requirement):
+        # by default its a local requirement like dependency
+        if isinstance(requirement, str):
+            role_name = requirement
+            scope = 'local'
+        else:
+            role_name = requirement.get('role')
+            scope = requirement.get('scope', 'local')
+        return {'role': RoleFinder.find_role(role_name, requirement),
+                "scope": scope}
+
+
+class Task(AnsibleTerm):
+    def __init__(self, name, path, data):
+        super(Task, self).__init__(name, path, data)
+        pass
+
+
+class Play(AnsibleTerm):
+    def __init__(self, name, path, data):
+        super(Play, self).__init__(name, path, data)
+        self.hosts = raw_data['hosts']
+        self.flow = self._build_flow()
+
+    def _build_flow(self):
+        flow = []
+        for snippet in ('pre_tasks', 'roles', 'tasks', 'post_tasks'):
+            if snippet == 'roles':
+                flow.extend([RoleFinder.find_role(r)
+                             for r in self._data.get(snippet, [])])
+            else:
+                flow.extend([Task(
+                    t.get('name', None), self._path, t)
+                             for t in self._data.get(snippet, [])])
+        return flow
+
+
+class Playbook(AnsibleTerm):
+    def __init__(self, inventory, path, data):
+        name = os.path.basename(path)
+        path = os.path.abspath(path)
+        super(Playbook, self).__init__(name, path, data)
+        self.inventory = inventory
+        self.basedir = os.path.abspath(os.path.dirname(self._path))
+        self.plays = []
+        self._collect_plays()
+
+    def _collect_plays(self, path=None):
+        path = path or self._path
+        basedir = os.path.abspath(os.path.dirname(path))
+        with open(path) as playfile:
+            playbook = yaml.safe_load(playfile)
+            for play in playbook:
+                if 'include' in play:
+                    # playbook inlcuding doesn't take condition in 1.9.6
+                    # templating in playbook level is evil
+                    included_path = path_dwim(basedir, play.get('include'))
+                    self._collect_plays(included_path)
+                else:
+                    name = play.get('name', os.path.basename(path))
+                    self.plays.append(Play(name, path, play))
+
+
+class AnsibleBooster(object):
+    def __init__(self, inventory=None, **ansible_args):
+        self.ansible_args = ansible_args
+        if inventory is not None:
+            self.inventory = self._build_inventory(
+                inventory, self.ansible_args)
+        self.tags = ansible_args.get('tags', ['all'])
+        self.skip_tags = ansible_args.get('skip_tags', [])
+
+    def _build_inventory(path, **options):
+        if ANSIBLE_VERSION == '2':
+            loader = DataLoader()
+            loader.set_vault_password(options['vault_pass'])
+            variable_manager = VariableManager()
+            variable_manager.extra_vars = load_extra_vars(loader=loader,
+                                                          options=options)
+            variable_manager.options_vars = load_options_vars(options)
+
+            inventory = Inventory(loader=loader,
+                                  variable_manager=variable_manager,
+                                  host_list=path)
+            inventory.subset(options['subset'])
+            return inventory
+        elif ANSIBLE_VERSION == '1':
+            inventory = Inventory(path, vault_password=options['vault_pass'])
+            inventory.subset(options['subset'])
+            return inventory
+
+    def boost_manifest(self, manifest):
+        pass
+
+    def boost_playbook(self, playbook):
+        pass
+
+    def boost_roles(self):
+        all_roles = RoleFinder.list_roles()
+        roles_map = {}
+        for role in all_roles:
+            if role.require == []:
+                roles_map[role.name] = role
+            else:
+                for r in role.requires:
+
+
+    def _tags_filter(self, tags):
+        if (tags == [] or self.tags == ['all'] or
+                any([t for t in tags if t in self.tags])):
+            return True
+        else:
+            return False
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('playbook',
+                        help="specify the playbook need to be boosted")
+    parser.add_argument('-i',
+                        '--inventory-file',
+                        dest='inventory',
+                        help=("specify inventory host file (default=%s)" %
+                              constants.DEFAULT_HOST_LIST),
+                        default=constants.DEFAULT_HOST_LIST)
+    parser.add_argument(
+        '-t',
+        '--tags',
+        dest='tags',
+        default='all',
+        help="only run plays and tasks tagged with these values")
+    parser.add_argument(
+        '--skip-tags',
+        dest='skip_tags',
+        help="only run plays and tasks whose tags do not match these values")
+    parser.add_argument(
+        '-l',
+        '--limit',
+        default=constants.DEFAULT_SUBSET,
+        dest='subset',
+        help='further limit selected hosts to an additional pattern')
+    parser.add_argument('--ask-vault-pass',
+                        default=False,
+                        dest='ask_vault_pass',
+                        action='store_true',
+                        help='ask for vault password')
+    parser.add_argument('--vault-password-file',
+                        default=constants.DEFAULT_VAULT_PASSWORD_FILE,
+                        dest='vault_password_file',
+                        help="vault password file")
+
+    args = parser.parse_args()
+    if args.vault_password_file is True:
+        vaultpass = getpass.getpass(prompt="Vault password: ")
+    elif args.vault_password_file is not None:
+        with open(args.vault_password_file) as f:
+            vaultpass = f.read().strip()
+    else:
+        vaultpass = None
+
+    booster = AnsibleBooster(inventory, playbook)
+
+    # booster = PlayBooster(inventory, playbook)
+    # booster.print_playbook()
