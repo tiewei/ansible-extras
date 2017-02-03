@@ -637,6 +637,91 @@ class CIMCBroker(object):
         return {"vmedias": dict(enabled=True,
                                 mappings=vmedia_mappings)}
 
+    def get_storage_adapters(self):
+        """Get CIMC storage adaptor information.
+
+        Currently only supports virtualdrives and physical drives,
+        no flexflash drive support.
+        """
+        with self._cimc_handle() as handle:
+            # get virtual drives
+            virtual_drives = self._get_virtual_drives(handle)
+            physical_drives = self._get_physical_drives(handle)
+
+        return {"storage_adapters": dict(
+            virtual_drives=virtual_drives,
+            physical_drives=physical_drives)}
+
+    def _get_physical_drives(self, handle):
+        physical_drives = []
+        physical_drives_obj = handle.get_imc_managedobject(
+            None, imcsdk.StorageLocalDisk.class_id())
+        for phy_dev in physical_drives_obj:
+            physical_drives.append(dict(
+                adminaction=phy_dev.AdminAction,
+                childaction=phy_dev.ChildAction,
+                coercedsize=phy_dev.CoercedSize,
+                dn=phy_dev.Dn,
+                drivefirmware=phy_dev.DriveFirmware,
+                driveserialnumber=phy_dev.DriveSerialNumber,
+                drivestate=phy_dev.DriveState,
+                health=phy_dev.Health,
+                id=phy_dev.Id,
+                interfacetype=phy_dev.InterfaceType,
+                linkspeed=phy_dev.LinkSpeed,
+                mediatype=phy_dev.MediaType,
+                online=phy_dev.Online,
+                pdstatus=phy_dev.PdStatus,
+                predictivefailurecount=phy_dev.PredictiveFailureCount,
+                productid=phy_dev.ProductId,
+                rn=phy_dev.Rn,
+                status=phy_dev.Status,
+                vendor=phy_dev.Vendor))
+        return physical_drives
+
+    def _get_virtual_drives(self, handle):
+        virtual_drives = []
+        virtual_drives_obj = handle.get_imc_managedobject(
+            None, imcsdk.StorageVirtualDrive.class_id())
+
+        for vdev in virtual_drives_obj:
+            vdev_data = dict(
+                accesspolicy=vdev.AccessPolicy,
+                adminaction=vdev.AdminAction,
+                allowbackgroundinit=vdev.AllowBackgroundInit,
+                autodeleteoldest=vdev.AutoDeleteOldest,
+                autosnapshot=vdev.AutoSnapshot,
+                bootdrive=vdev.BootDrive,
+                cachepolicy=vdev.CachePolicy,
+                childaction=vdev.ChildAction,
+                currentwritecachepolicy=vdev.CurrentWriteCachePolicy,
+                diskcachepolicy=vdev.DiskCachePolicy,
+                dn=vdev.Dn,
+                drivestate=vdev.DriveState,
+                drivesperspan=vdev.DrivesPerSpan,
+                health=vdev.Health,
+                id=vdev.Id,
+                name=vdev.Name,
+                raidlevel=vdev.RaidLevel,
+                readpolicy=vdev.ReadPolicy,
+                requestedwritecachepolicy=vdev.RequestedWriteCachePolicy,
+                rn=vdev.Rn,
+                size=vdev.Size,
+                spandepth=vdev.SpanDepth,
+                status=vdev.Status,
+                stripsize=vdev.StripSize,
+                targetid=vdev.TargetId,
+                vdstatus=vdev.VdStatus)
+            local_disks = handle.get_imc_managedobject(
+                in_mo=vdev, class_id=imcsdk.StorageLocalDiskUsage.class_id())
+            vdev_data['physical_drive_ids'] = [
+                disk.PhysicalDrive for disk in local_disks]
+            virtual_drives.append(vdev_data)
+        return virtual_drives
+
+    def set_storageadapter(self, **config):
+        pass
+
 
 def main():
     module = AnsibleModule(
@@ -646,7 +731,8 @@ def main():
             password=dict(required=True, no_log=True),
             timeout=dict(required=False, type='int', default=30),
             resource=dict(required=True, choices=['power', 'boot_device',
-                                                  'net_adaptors', 'vmedias']),
+                                                  'net_adaptors', 'vmedias',
+                                                  'storage_adapters']),
             task=dict(required=False, choices=['set', 'get'],
                       default='get'),
             config=dict(type='dict', default={}, required=False),
@@ -675,4 +761,3 @@ from ansible.module_utils.basic import *
 
 if __name__ == '__main__':
     main()
-
