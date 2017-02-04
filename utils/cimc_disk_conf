@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#!/usr/bin/env python
 
 # This is a script that use CIMC CLI expect to setup disk
 # on multiple servers. Config file example
@@ -39,7 +39,6 @@ class CIMCDiskConf(threading.Thread):
                            self.password,
                            auto_prompt_reset=False)
             for task in self.tasks:
-                # import pdb;pdb.set_trace()
                 getattr(self, task['name'])(task['args'])
                 self._back_top()
         finally:
